@@ -166,7 +166,9 @@ curl_verbose_msg="enabled (--disable-verbose)"
     curl_psl_msg="no      (--with-libpsl)"
  curl_altsvc_msg="enabled";
     ssl_backends=
-
+     curl_h1_msg="enabled (--with-hyper)"
+     curl_h2_msg="no      (--with-nghttp2)"
+     curl_h3_msg="no      (--with-ngtcp2, --with-quiche)"
 
 enable_altsvc="yes"
 
@@ -389,6 +391,7 @@ AC_HELP_STRING([--disable-http],[Disable HTTP support]),
        AC_SUBST(CURL_DISABLE_RTSP, [1])
        dnl toggle off alt-svc too when HTTP is disabled
        AC_DEFINE(CURL_DISABLE_ALTSVC, 1, [disable alt-svc])
+       curl_h1_msg="no      (--enable-http, --with-hyper)"
        curl_altsvc_msg="no";
        enable_altsvc="no"
        ;;
@@ -3552,7 +3555,6 @@ case "$OPT_H2" in
     ;;
 esac
 
-curl_h2_msg="no      (--with-nghttp2)"
 if test X"$want_h2" != Xno; then
   dnl backup the pre-nghttp2 variables
   CLEANLDFLAGS="$LDFLAGS"
@@ -3611,7 +3613,6 @@ dnl Check for ngtcp2 (QUIC)
 dnl **********************************************************************
 
 OPT_TCP2="yes"
-curl_h3_msg="no      (--with-ngtcp2, --with-quiche)"
 
 if test "x$disable_http" = "xyes"; then
   # without HTTP, ngtcp2 is no use
@@ -3992,7 +3993,6 @@ dnl Check for Hyper
 dnl **********************************************************************
 
 OPT_HYPER="yes"
-curl_hyper_msg="no      (--with-hyper)"
 
 if test "x$disable_http" = "xyes"; then
   # without HTTP, hyper is of no use
@@ -4061,7 +4061,8 @@ if test X"$want_hyper" != Xno; then
        AC_CHECK_HEADERS(hyper.h,
           experimental="$experimental Hyper"
           AC_MSG_NOTICE([Hyper support is experimental])
-          curl_hyper_msg="enabled"
+          curl_h1_msg="enabled (Hyper)"
+          curl_h2_msg=$curl_h1_msg
           HYPER_ENABLED=1
           AC_DEFINE(USE_HYPER, 1, [if hyper is in use])
           AC_SUBST(USE_HYPER, [1])
@@ -5354,10 +5355,10 @@ AC_MSG_NOTICE([Configured to build curl/libcurl:
   Metalink:         ${curl_mtlnk_msg}
   PSL:              ${curl_psl_msg}
   Alt-svc:          ${curl_altsvc_msg}
+  HTTP1:            ${curl_h1_msg}
   HTTP2:            ${curl_h2_msg}
   HTTP3:            ${curl_h3_msg}
   ECH:              ${curl_ech_msg}
-  Hyper:            ${curl_hyper_msg}
   Protocols:        ${SUPPORT_PROTOCOLS}
   Features:         ${SUPPORT_FEATURES}
 ])
