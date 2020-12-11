@@ -113,8 +113,6 @@ static size_t write_cb(void *userp, hyper_context *ctx,
   return (size_t)nwrote;
 }
 
-#define HYPER_ITER_ERROR HYPER_ITER_BREAK /* the best by hyper.h */
-
 static int hyper_each_header(void *userdata,
                              const uint8_t *name,
                              size_t name_len,
@@ -132,11 +130,11 @@ static int hyper_each_header(void *userdata,
   if(name_len) {
     if(Curl_dyn_addf(&data->state.headerb, "%.*s: %.*s\r\n",
                      (int) name_len, name, (int) value_len, value))
-      return HYPER_ITER_ERROR;
+      return HYPER_ITER_BREAK;
   }
   else {
     if(Curl_dyn_add(&data->state.headerb, "\r\n"))
-      return HYPER_ITER_ERROR;
+      return HYPER_ITER_BREAK;
   }
   len = Curl_dyn_len(&data->state.headerb);
   headp = Curl_dyn_ptr(&data->state.headerb);
@@ -144,7 +142,7 @@ static int hyper_each_header(void *userdata,
   result = Curl_http_header(data, data->conn, headp);
   if(result) {
     data->state.hresult = result;
-    return HYPER_ITER_ERROR;
+    return HYPER_ITER_BREAK;
   }
 
   Curl_debug(data, CURLINFO_HEADER_IN, headp, len);
@@ -154,7 +152,7 @@ static int hyper_each_header(void *userdata,
   Curl_set_in_callback(data, false);
   if(wrote != len) {
     data->state.hresult = CURLE_ABORTED_BY_CALLBACK;
-    return HYPER_ITER_ERROR;
+    return HYPER_ITER_BREAK;
   }
 
   data->info.header_size += (long)len;
@@ -171,7 +169,7 @@ static int hyper_body_chunk(void *userdata, const hyper_buf *chunk)
   struct SingleRequest *k = &data->req;
   size_t wrote;
 
-  if((0 == k->bodywrites++) && k->newurl) {
+  if(0 == k->bodywrites++) {
 #if 0
     if(conn->bits.close) {
       /* Abort after the headers if "follow Location" is set and we're set
@@ -179,11 +177,20 @@ static int hyper_body_chunk(void *userdata, const hyper_buf *chunk)
       return CURLE_OK;
     }
 #endif
-    /* We have a new url to load, but since we want to be able
-       to re-use this connection properly, we read the full
-       response in "ignore more" */
-    k->ignorebody = TRUE;
-    infof(data, "Ignoring the response-body\n");
+    bool done = FALSE;
+    CURLcode result = Curl_http_firstwrite(data, data->conn, &done);
+    if(result || done) {
+      infof(data, "Return early from hyper_body_chunk\n");
+      data->state.hresult = result;
+      return HYPER_ITER_BREAK;
+    }
+    if(k->newurl) {
+      /* We have a new url to load, but since we want to be able
+         to re-use this connection properly, we read the full
+         response in "ignore more" */
+      k->ignorebody = TRUE;
+      infof(data, "Ignoring the response-body\n");
+    }
   }
   if(k->ignorebody)
     return HYPER_ITER_CONTINUE;
@@ -193,7 +200,7 @@ static int hyper_body_chunk(void *userdata, const hyper_buf *chunk)
   Curl_set_in_callback(data, false);
 
   if(wrote != len)
-    return HYPER_ITER_ERROR;
+    return HYPER_ITER_BREAK;
 
   data->req.bytecount += len;
   Curl_pgrsSetDownloadCounter(data, data->req.bytecount);
@@ -314,13 +321,19 @@ static CURLcode hyperstream(struct Curl_easy *data,
     hyper_task_free(task);
 
     if(t == HYPER_TASK_ERROR) {
-      uint8_t errbuf[256];
-      size_t errlen = hyper_error_print(hypererr, errbuf, sizeof(errbuf));
-      failf(data, "Hyper: %.*s", (int)errlen, errbuf);
+      hyper_code errnum = hyper_error_code(hypererr);
+      if(errnum == HYPERE_ABORTED_BY_CALLBACK)
+        /* override Hyper's view, might not even be an error */
+        result = data->state.hresult;
+      else {
+        uint8_t errbuf[256];
+        size_t errlen = hyper_error_print(hypererr, errbuf, sizeof(errbuf));
+        failf(data, "Hyper: %.*s", (int)errlen, errbuf);
+        result = CURLE_RECV_ERROR; /* not a very good return code */
+      }
+      if(result)
+        *done = TRUE;
       hyper_error_free(hypererr);
-
-      *done = TRUE;
-      result = CURLE_RECV_ERROR; /* not a very good return code */
       break;
     }
     else if(h->init) {
@@ -519,7 +532,13 @@ static int uploadpostfields(void *userdata, hyper_context *ctx,
 {
   struct Curl_easy *data = (struct Curl_easy *)userdata;
   (void)ctx;
-  *chunk = hyper_buf_copy(data->set.postfields, data->req.p.http->postsize);
+  if(data->req.upload_done)
+    *chunk = NULL; /* nothing more to deliver */
+  else {
+    /* send everything off in a single go */
+    *chunk = hyper_buf_copy(data->set.postfields, data->req.p.http->postsize);
+    data->req.upload_done = TRUE;
+  }
   return HYPER_POLL_READY;
 }
 
@@ -626,7 +645,7 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
   const char *method;
   Curl_HttpReq httpreq;
   bool h2 = FALSE;
-  const char *te = ""; /* transfer-encoding */
+  const char *te = NULL; /* transfer-encoding */
 
   /* Always consider the DO phase done after this function call, even if there
      may be parts of the request that is not yet sent, since we can deal with
@@ -656,6 +675,10 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
     if(result)
       return result;
   }
+
+  result = Curl_http_resume(data, conn, httpreq);
+  if(result)
+    return result;
 
   result = Curl_http_range(data, conn, httpreq);
   if(result)
@@ -769,12 +792,17 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
      Curl_hyper_header(data, headers, data->state.aptr.rangeline))
     goto error;
 
-  if(data->state.aptr.uagent &&
+  if(data->set.str[STRING_USERAGENT] &&
+     *data->set.str[STRING_USERAGENT] &&
+     data->state.aptr.uagent &&
      Curl_hyper_header(data, headers, data->state.aptr.uagent))
     goto error;
 
   p_accept = Curl_checkheaders(conn, "Accept")?NULL:"Accept: */*\r\n";
   if(p_accept && Curl_hyper_header(data, headers, p_accept))
+    goto error;
+
+  if(te && Curl_hyper_header(data, headers, te))
     goto error;
 
 #ifndef CURL_DISABLE_PROXY
@@ -810,6 +838,7 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
 
   Curl_debug(data, CURLINFO_HEADER_OUT, (char *)"\r\n", 2);
 
+  data->req.upload_chunky = FALSE;
   sendtask = hyper_clientconn_send(client, req);
   if(!sendtask) {
     failf(data, "hyper_clientconn_send\n");
