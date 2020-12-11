@@ -2165,6 +2165,8 @@ CURLcode Curl_http_target(struct Curl_easy *data,
   }
 
   else
+#else
+    (void)conn; /* not used in disabled-proxy builds */
 #endif
   {
     result = Curl_dyn_add(r, path);
@@ -2670,7 +2672,7 @@ CURLcode Curl_http_range(struct Curl_easy *data,
       /* if a line like this was already allocated, free the previous one */
       free(data->state.aptr.rangeline);
       data->state.aptr.rangeline = aprintf("Range: bytes=%s\r\n",
-                                         data->state.range);
+                                           data->state.range);
     }
     else if((httpreq == HTTPREQ_POST || httpreq == HTTPREQ_PUT) &&
             !Curl_checkheaders(conn, "Content-Range")) {
@@ -2709,6 +2711,149 @@ CURLcode Curl_http_range(struct Curl_easy *data,
         return CURLE_OUT_OF_MEMORY;
     }
   }
+  return CURLE_OK;
+}
+
+CURLcode Curl_http_resume(struct Curl_easy *data,
+                          struct connectdata *conn,
+                          Curl_HttpReq httpreq)
+{
+  if((HTTPREQ_POST == httpreq || HTTPREQ_PUT == httpreq) &&
+     data->state.resume_from) {
+    /**********************************************************************
+     * Resuming upload in HTTP means that we PUT or POST and that we have
+     * got a resume_from value set. The resume value has already created
+     * a Range: header that will be passed along. We need to "fast forward"
+     * the file the given number of bytes and decrease the assume upload
+     * file size before we continue this venture in the dark lands of HTTP.
+     * Resuming mime/form posting at an offset > 0 has no sense and is ignored.
+     *********************************************************************/
+
+    if(data->state.resume_from < 0) {
+      /*
+       * This is meant to get the size of the present remote-file by itself.
+       * We don't support this now. Bail out!
+       */
+      data->state.resume_from = 0;
+    }
+
+    if(data->state.resume_from && !data->state.this_is_a_follow) {
+      /* do we still game? */
+
+      /* Now, let's read off the proper amount of bytes from the
+         input. */
+      int seekerr = CURL_SEEKFUNC_CANTSEEK;
+      if(conn->seek_func) {
+        Curl_set_in_callback(data, true);
+        seekerr = conn->seek_func(conn->seek_client, data->state.resume_from,
+                                  SEEK_SET);
+        Curl_set_in_callback(data, false);
+      }
+
+      if(seekerr != CURL_SEEKFUNC_OK) {
+        curl_off_t passed = 0;
+
+        if(seekerr != CURL_SEEKFUNC_CANTSEEK) {
+          failf(data, "Could not seek stream");
+          return CURLE_READ_ERROR;
+        }
+        /* when seekerr == CURL_SEEKFUNC_CANTSEEK (can't seek to offset) */
+        do {
+          size_t readthisamountnow =
+            (data->state.resume_from - passed > data->set.buffer_size) ?
+            (size_t)data->set.buffer_size :
+            curlx_sotouz(data->state.resume_from - passed);
+
+          size_t actuallyread =
+            data->state.fread_func(data->state.buffer, 1, readthisamountnow,
+                                   data->state.in);
+
+          passed += actuallyread;
+          if((actuallyread == 0) || (actuallyread > readthisamountnow)) {
+            /* this checks for greater-than only to make sure that the
+               CURL_READFUNC_ABORT return code still aborts */
+            failf(data, "Could only read %" CURL_FORMAT_CURL_OFF_T
+                  " bytes from the input", passed);
+            return CURLE_READ_ERROR;
+          }
+        } while(passed < data->state.resume_from);
+      }
+
+      /* now, decrease the size of the read */
+      if(data->state.infilesize>0) {
+        data->state.infilesize -= data->state.resume_from;
+
+        if(data->state.infilesize <= 0) {
+          failf(data, "File already completely uploaded");
+          return CURLE_PARTIAL_FILE;
+        }
+      }
+      /* we've passed, proceed as normal */
+    }
+  }
+  return CURLE_OK;
+}
+
+CURLcode Curl_http_firstwrite(struct Curl_easy *data,
+                              struct connectdata *conn,
+                              bool *done)
+{
+  struct SingleRequest *k = &data->req;
+  DEBUGASSERT(conn->handler->protocol&(PROTO_FAMILY_HTTP|CURLPROTO_RTSP));
+  if(data->req.newurl) {
+    if(conn->bits.close) {
+      /* Abort after the headers if "follow Location" is set
+         and we're set to close anyway. */
+      k->keepon &= ~KEEP_RECV;
+      *done = TRUE;
+      return CURLE_OK;
+    }
+    /* We have a new url to load, but since we want to be able to re-use this
+       connection properly, we read the full response in "ignore more" */
+    k->ignorebody = TRUE;
+    infof(data, "Ignoring the response-body\n");
+  }
+  if(data->state.resume_from && !k->content_range &&
+     (data->state.httpreq == HTTPREQ_GET) &&
+     !k->ignorebody) {
+
+    if(k->size == data->state.resume_from) {
+      /* The resume point is at the end of file, consider this fine even if it
+         doesn't allow resume from here. */
+      infof(data, "The entire document is already downloaded");
+      connclose(conn, "already downloaded");
+      /* Abort download */
+      k->keepon &= ~KEEP_RECV;
+      *done = TRUE;
+      return CURLE_OK;
+    }
+
+    /* we wanted to resume a download, although the server doesn't seem to
+     * support this and we did this with a GET (if it wasn't a GET we did a
+     * POST or PUT resume) */
+    failf(data, "HTTP server doesn't seem to support "
+          "byte ranges. Cannot resume.");
+    return CURLE_RANGE_ERROR;
+  }
+
+  if(data->set.timecondition && !data->state.range) {
+    /* A time condition has been set AND no ranges have been requested. This
+       seems to be what chapter 13.3.4 of RFC 2616 defines to be the correct
+       action for a HTTP/1.1 client */
+
+    if(!Curl_meets_timecondition(data, k->timeofdoc)) {
+      *done = TRUE;
+      /* We're simulating a http 304 from server so we return
+         what should have been returned from the server */
+      data->info.httpcode = 304;
+      infof(data, "Simulate a HTTP 304 response!\n");
+      /* we abort the transfer before it is completed == we ruin the
+         re-use ability. Close the connection */
+      connclose(conn, "Simulated 304 handling");
+      return CURLE_OK;
+    }
+  } /* we have a time condition */
+
   return CURLE_OK;
 }
 
@@ -2877,79 +3022,9 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
 
   p_accept = Curl_checkheaders(conn, "Accept")?NULL:"Accept: */*\r\n";
 
-  if((HTTPREQ_POST == httpreq || HTTPREQ_PUT == httpreq) &&
-     data->state.resume_from) {
-    /**********************************************************************
-     * Resuming upload in HTTP means that we PUT or POST and that we have
-     * got a resume_from value set. The resume value has already created
-     * a Range: header that will be passed along. We need to "fast forward"
-     * the file the given number of bytes and decrease the assume upload
-     * file size before we continue this venture in the dark lands of HTTP.
-     * Resuming mime/form posting at an offset > 0 has no sense and is ignored.
-     *********************************************************************/
-
-    if(data->state.resume_from < 0) {
-      /*
-       * This is meant to get the size of the present remote-file by itself.
-       * We don't support this now. Bail out!
-       */
-      data->state.resume_from = 0;
-    }
-
-    if(data->state.resume_from && !data->state.this_is_a_follow) {
-      /* do we still game? */
-
-      /* Now, let's read off the proper amount of bytes from the
-         input. */
-      int seekerr = CURL_SEEKFUNC_CANTSEEK;
-      if(conn->seek_func) {
-        Curl_set_in_callback(data, true);
-        seekerr = conn->seek_func(conn->seek_client, data->state.resume_from,
-                                  SEEK_SET);
-        Curl_set_in_callback(data, false);
-      }
-
-      if(seekerr != CURL_SEEKFUNC_OK) {
-        curl_off_t passed = 0;
-
-        if(seekerr != CURL_SEEKFUNC_CANTSEEK) {
-          failf(data, "Could not seek stream");
-          return CURLE_READ_ERROR;
-        }
-        /* when seekerr == CURL_SEEKFUNC_CANTSEEK (can't seek to offset) */
-        do {
-          size_t readthisamountnow =
-            (data->state.resume_from - passed > data->set.buffer_size) ?
-            (size_t)data->set.buffer_size :
-            curlx_sotouz(data->state.resume_from - passed);
-
-          size_t actuallyread =
-            data->state.fread_func(data->state.buffer, 1, readthisamountnow,
-                                   data->state.in);
-
-          passed += actuallyread;
-          if((actuallyread == 0) || (actuallyread > readthisamountnow)) {
-            /* this checks for greater-than only to make sure that the
-               CURL_READFUNC_ABORT return code still aborts */
-            failf(data, "Could only read %" CURL_FORMAT_CURL_OFF_T
-                  " bytes from the input", passed);
-            return CURLE_READ_ERROR;
-          }
-        } while(passed < data->state.resume_from);
-      }
-
-      /* now, decrease the size of the read */
-      if(data->state.infilesize>0) {
-        data->state.infilesize -= data->state.resume_from;
-
-        if(data->state.infilesize <= 0) {
-          failf(data, "File already completely uploaded");
-          return CURLE_PARTIAL_FILE;
-        }
-      }
-      /* we've passed, proceed as normal */
-    }
-  }
+  result = Curl_http_resume(data, conn, httpreq);
+  if(result)
+    return result;
 
   result = Curl_http_range(data, conn, httpreq);
   if(result)
@@ -2963,12 +3038,12 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
   /* add the main request stuff */
   /* GET/HEAD/POST/PUT */
   result = Curl_dyn_addf(&req, "%s ", request);
-  if(result)
+  if(!result)
+    result = Curl_http_target(data, conn, &req);
+  if(result) {
+    Curl_dyn_free(&req);
     return result;
-
-  result = Curl_http_target(data, conn, &req);
-  if(result)
-    return result;
+  }
 
 #ifndef CURL_DISABLE_ALTSVC
   if(conn->bits.altused && !Curl_checkheaders(conn, "Alt-Used")) {
@@ -3033,8 +3108,10 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
   Curl_safefree(data->state.aptr.proxyuserpwd);
   free(altused);
 
-  if(result)
+  if(result) {
+    Curl_dyn_free(&req);
     return result;
+  }
 
   if(!(conn->handler->flags&PROTOPT_SSL) &&
      conn->httpversion != 20 &&
@@ -3042,30 +3119,31 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
     /* append HTTP2 upgrade magic stuff to the HTTP request if it isn't done
        over SSL */
     result = Curl_http2_request_upgrade(&req, conn);
-    if(result)
+    if(result) {
+      Curl_dyn_free(&req);
       return result;
+    }
   }
 
   result = Curl_http_cookies(data, conn, &req);
-  if(result)
-    return result;
+  if(!result)
+    result = Curl_add_timecondition(conn, &req);
+  if(!result)
+    result = Curl_add_custom_headers(conn, FALSE, &req);
 
-  result = Curl_add_timecondition(conn, &req);
-  if(result)
-    return result;
+  if(!result) {
+    http->postdata = NULL;  /* nothing to post at this point */
+    if((httpreq == HTTPREQ_GET) ||
+       (httpreq == HTTPREQ_HEAD))
+      Curl_pgrsSetUploadSize(data, 0); /* nothing */
 
-  result = Curl_add_custom_headers(conn, FALSE, &req);
-  if(result)
+    /* bodysend takes ownership of the 'req' memory on success */
+    result = Curl_http_bodysend(data, conn, &req, httpreq);
+  }
+  if(result) {
+    Curl_dyn_free(&req);
     return result;
-
-  http->postdata = NULL;  /* nothing to post at this point */
-  if((httpreq == HTTPREQ_GET) ||
-     (httpreq == HTTPREQ_HEAD))
-    Curl_pgrsSetUploadSize(data, 0); /* nothing */
-
-  result = Curl_http_bodysend(data, conn, &req, httpreq);
-  if(result)
-    return result;
+  }
 
   if(!http->postsize && (http->sending != HTTPSEND_REQUEST))
     data->req.upload_done = TRUE;
@@ -3077,7 +3155,7 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
     if(Curl_pgrsUpdate(conn))
       result = CURLE_ABORTED_BY_CALLBACK;
 
-    if(data->req.writebytecount >= http->postsize) {
+    if(!http->postsize) {
       /* already sent the entire request body, mark the "upload" as
          complete */
       infof(data, "upload completely sent off: %" CURL_FORMAT_CURL_OFF_T
