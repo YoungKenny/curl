@@ -2849,7 +2849,7 @@ typedef enum {
   CURLVERSION_SIXTH,
   CURLVERSION_SEVENTH,
   CURLVERSION_EIGHTH,
-  CURLVERSION_NINETH,
+  CURLVERSION_NINTH,
   CURLVERSION_LAST /* never actually use this */
 } CURLversion;
 
@@ -2858,7 +2858,7 @@ typedef enum {
    meant to be a built-in version number for what kind of struct the caller
    expects. If the struct ever changes, we redefine the NOW to another enum
    from above. */
-#define CURLVERSION_NOW CURLVERSION_NINETH
+#define CURLVERSION_NOW CURLVERSION_NINTH
 
 struct curl_version_info_data {
   CURLversion age;          /* age of the returned struct */
